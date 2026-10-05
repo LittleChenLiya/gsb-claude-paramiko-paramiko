@@ -12,3 +12,6 @@ _build
 coverage.xml
 htmlcov
 uv.lock
+
+# local test venv
+.venv/

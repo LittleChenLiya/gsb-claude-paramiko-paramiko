@@ -76,6 +76,7 @@ from paramiko.sftp_attr import SFTPAttributes
 from paramiko.sftp_handle import SFTPHandle
 from paramiko.sftp_si import SFTPServerInterface
 from paramiko.sftp_file import SFTPFile
+from paramiko.sftp_prefetch import PrefetchReader
 from paramiko.message import Message
 from paramiko.packet import Packetizer
 from paramiko.file import BufferedFile
