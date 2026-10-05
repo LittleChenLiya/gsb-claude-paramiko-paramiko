@@ -163,7 +163,10 @@ class StubSFTPServer(SFTPServerInterface):
         oldpath = self._realpath(oldpath)
         newpath = self._realpath(newpath)
         try:
-            os.rename(oldpath, newpath)
+            # os.replace, not os.rename: posix-rename semantics are an
+            # atomic replace, and os.rename refuses to overwrite an
+            # existing target on some platforms (e.g. Windows).
+            os.replace(oldpath, newpath)
         except OSError as e:
             return SFTPServer.convert_errno(e.errno)
         return SFTP_OK

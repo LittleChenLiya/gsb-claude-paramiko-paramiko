@@ -2,6 +2,22 @@
 Changelog
 =========
 
+- :feature:`-` Added an explicit atomic publish mode to `SFTPClient
+  <paramiko.sftp_client.SFTPClient>`: `put_atomic
+  <paramiko.sftp_client.SFTPClient.put_atomic>` and `putfo_atomic
+  <paramiko.sftp_client.SFTPClient.putfo_atomic>` stage the data in a
+  temporary file and then move it over the target with the OpenSSH
+  ``posix-rename@openssh.com`` extension. Support for the extension is
+  confirmed from the server handshake up front (via the new
+  ``server_extensions`` attribute); servers not advertising it are refused
+  before anything is written -- there is no silent fallback to a non-atomic
+  delete-then-rename. Failures are reported per phase
+  (``write``/``close``/``rename``) via the new `SFTPPublishError
+  <paramiko.sftp_client.SFTPPublishError>`, a failed publish never
+  overwrites the previous target, and only the temporary file created by
+  the failed call itself is cleaned up. Servers can declare the extensions
+  they advertise with the new ``server_extensions`` attribute on
+  `SFTPServerInterface <paramiko.sftp_si.SFTPServerInterface>`.
 - :feature:`-` Added support for the ``mlkem768x25519-sha256`` post-quantum
   hybrid key exchange method described in
   ``draft-ietf-sshm-mlkem-hybrid-kex``. It pairs ML-KEM-768 (FIPS 203) with

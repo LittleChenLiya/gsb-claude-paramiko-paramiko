@@ -40,6 +40,14 @@ class SFTPServerInterface:
     clients & servers obey the requirement that paths be encoded in UTF-8.
     """
 
+    #: Optional flat list of extension name/data pairs (for example
+    #: ``["posix-rename@openssh.com", "1"]``) advertised to the client during
+    #: the protocol version handshake.  When ``None`` (the default), the
+    #: library's built-in default list is advertised.  Only advertise an
+    #: extension if the corresponding methods (such as `posix_rename`) are
+    #: actually implemented.
+    server_extensions = None
+
     def __init__(self, server, *args, **kwargs):
         """
         Create a new SFTPServerInterface object.  This method does nothing by

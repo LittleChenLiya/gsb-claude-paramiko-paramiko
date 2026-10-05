@@ -135,8 +135,38 @@ class BaseSFTP:
         self.logger = util.get_logger("paramiko.sftp")
         self.sock = None
         self.ultra_debug = False
+        #: Extensions advertised by the server during the protocol version
+        #: handshake, as a dict of extension name to extension data (both
+        #: text).  Empty until (and unless) the handshake completes.
+        self.server_extensions = {}
 
     # ...internals...
+
+    @staticmethod
+    def _parse_extension_pairs(data):
+        """
+        Parse the ``(name, data)`` extension pairs found in a raw
+        ``SSH_FXP_VERSION`` payload (everything after the version number)
+        into a dict mapping extension name to extension data.
+        """
+        extensions = {}
+        while len(data) >= 4:
+            nlen = struct.unpack(">I", data[:4])[0]
+            data = data[4:]
+            if len(data) < nlen + 4:
+                break
+            name = data[:nlen]
+            data = data[nlen:]
+            vlen = struct.unpack(">I", data[:4])[0]
+            data = data[4:]
+            if len(data) < vlen:
+                break
+            value = data[:vlen]
+            data = data[vlen:]
+            extensions[name.decode("utf-8", "replace")] = value.decode(
+                "utf-8", "replace"
+            )
+        return extensions
 
     def _send_version(self):
         m = Message()
@@ -148,17 +178,19 @@ class BaseSFTP:
         version = struct.unpack(">I", data[:4])[0]
         #        if version != _VERSION:
         #            raise SFTPError('Incompatible sftp protocol')
+        self.server_extensions = self._parse_extension_pairs(data[4:])
         return version
 
-    def _send_server_version(self):
+    def _send_server_version(self, extension_pairs=None):
         # winscp will freak out if the server sends version info before the
         # client finishes sending INIT.
         t, data = self._read_packet()
         if t != CMD_INIT:
             raise SFTPError("Incompatible sftp protocol")
         version = struct.unpack(">I", data[:4])[0]
-        # advertise that we support "check-file"
-        extension_pairs = ["check-file", "md5,sha1"]
+        if extension_pairs is None:
+            # advertise that we support "check-file"
+            extension_pairs = ["check-file", "md5,sha1"]
         msg = Message()
         msg.add_int(_VERSION)
         msg.add(*extension_pairs)

@@ -134,7 +134,11 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
     def start_subsystem(self, name, transport, channel):
         self.sock = channel
         self._log(DEBUG, "Started sftp server on channel {!r}".format(channel))
-        self._send_server_version()
+        # advertise whatever extensions the server interface declares (if it
+        # declares none, the library default list is used)
+        self._send_server_version(
+            getattr(self.server, "server_extensions", None)
+        )
         self.server.session_started()
         while True:
             try:
