@@ -75,13 +75,21 @@ class SFTPFile(BufferedFile):
     def __del__(self):
         self._close(async_=True)
 
-    def close(self):
+    def close(self, raise_on_error=False):
         """
         Close the file.
-        """
-        self._close(async_=False)
 
-    def _close(self, async_=False):
+        :param bool raise_on_error:
+            when ``False`` (the default), errors sending or confirming the
+            close are swallowed, matching historical behaviour.  When ``True``,
+            an error response from the server (or a transport error) is raised
+            instead of being silently ignored.  This is used by operations
+            that need to distinguish a close failure from a successful close,
+            such as atomic publish.
+        """
+        self._close(async_=False, raise_on_error=raise_on_error)
+
+    def _close(self, async_=False, raise_on_error=False):
         # We allow double-close without signaling an error, because real
         # Python file objects do.  However, we must protect against actually
         # sending multiple CMD_CLOSE packets, because after we close our
@@ -104,10 +112,12 @@ class SFTPFile(BufferedFile):
                 self.sftp._request(CMD_CLOSE, self.handle)
         except EOFError:
             # may have outlived the Transport connection
-            pass
+            if raise_on_error:
+                raise
         except (IOError, socket.error):
             # may have outlived the Transport connection
-            pass
+            if raise_on_error:
+                raise
 
     def _data_in_prefetch_requests(self, offset, size):
         k = [

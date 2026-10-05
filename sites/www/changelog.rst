@@ -2,6 +2,31 @@
 Changelog
 =========
 
+- :feature:`-` Added an explicit atomic *publish* mode for uploading files to
+  an SFTP server: `SFTPClient.publish <paramiko.sftp_client.SFTPClient.publish>`
+  and `SFTPClient.publishfo <paramiko.sftp_client.SFTPClient.publishfo>`. A
+  publish writes a temporary file in the same folder as the destination,
+  closes it, and then uses the OpenSSH ``posix-rename@openssh.com`` extension
+  to rename the temporary file over the destination. Because posix-rename
+  overwrites an existing destination atomically, a failure at any stage leaves
+  the previous destination file intact.
+
+  The server must advertise support for the ``posix-rename`` extension in its
+  version packet; this is checked *before* anything is written, and a server
+  without the extension is rejected rather than silently falling back to a
+  delete-then-rename sequence. Failures are reported in stages via
+  `.SFTPublishError <paramiko.sftp_client.SFTPublishError>`, whose ``phase``
+  attribute is one of ``"capability"``, ``"write"``, ``"close"``, or
+  ``"rename"``. On failure, only the temporary path created by the attempt is
+  cleaned up; the existing destination is never touched. The plain
+  `SFTPClient.rename <paramiko.sftp_client.SFTPClient.rename>` entry point is
+  unchanged.
+
+  Servers can advertise the extension via the new ``server_extensions``
+  attribute on `.BaseSFTP <paramiko.sftp.BaseSFTP>`; clients can query it with
+  `SFTPClient.extension_supported
+  <paramiko.sftp_client.SFTPClient.extension_supported>`.
+
 - :feature:`-` Added support for the ``mlkem768x25519-sha256`` post-quantum
   hybrid key exchange method described in
   ``draft-ietf-sshm-mlkem-hybrid-kex``. It pairs ML-KEM-768 (FIPS 203) with

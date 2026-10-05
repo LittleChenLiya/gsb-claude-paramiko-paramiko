@@ -20,6 +20,7 @@
 from binascii import hexlify
 import errno
 import os
+import posixpath
 import stat
 import threading
 import time
@@ -85,6 +86,29 @@ def _to_unicode(s):
 
 
 b_slash = b"/"
+
+# Name of the OpenSSH posix-rename SFTP extension, as advertised in the
+# server's version packet.
+POSIX_RENAME_EXTENSION = "posix-rename@openssh.com"
+
+
+class SFTPublishError(SFTPError):
+    """
+    Raised when an atomic publish (write a temporary file, close it, then
+    posix-rename it over the destination) fails.
+
+    The ``phase`` attribute reports which stage of the publish failed, one
+    of ``"capability"``, ``"write"``, ``"close"``, or ``"rename"``.
+
+    A failed publish never modifies the existing destination file; only the
+    temporary path created for the attempt is cleaned up.
+    """
+
+    def __init__(self, phase, message):
+        self.phase = phase
+        super().__init__(
+            "publish failed during {} phase: {}".format(phase, message)
+        )
 
 
 class SFTPClient(BaseSFTP, ClosingContextManager):
@@ -444,6 +468,20 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             CMD_EXTENDED, "posix-rename@openssh.com", oldpath, newpath
         )
 
+    def extension_supported(self, name):
+        """
+        Return ``True`` if the server advertised the given SFTP extension
+        name (for example, ``"posix-rename@openssh.com"``) in its version
+        packet.
+
+        This lets capability-dependent operations check support *before*
+        attempting a request that the server might not understand.
+
+        :param str name: the extension name to look for
+        :return: ``True`` if the extension was advertised, else ``False``
+        """
+        return name in self._extensions
+
     def mkdir(self, path, mode=o777):
         """
         Create a folder (directory) named ``path`` with numeric mode ``mode``.
@@ -757,6 +795,194 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         file_size = os.stat(localpath).st_size
         with open(localpath, "rb") as fl:
             return self.putfo(fl, remotepath, file_size, callback, confirm)
+
+    def _publish_temp_path(self, remotepath):
+        """
+        Return a unique temporary path for a publish of ``remotepath``.
+
+        The temporary file lives in the same folder as the destination so
+        that the final posix-rename is atomic.  The path is generated here so
+        that cleanup can be limited to exactly the temporary path created by
+        this publish attempt.
+        """
+        directory = posixpath.dirname(remotepath)
+        base = posixpath.basename(remotepath)
+        suffix = hexlify(os.urandom(6))
+        name = b".%s.publish.%s" % (base, suffix)
+        if directory:
+            return posixpath.join(directory, name)
+        return name
+
+    def _publish_cleanup(self, temppath):
+        """
+        Best-effort removal of the temporary path created by a failed
+        publish.  This is the only path removed; the existing destination is
+        never touched.
+        """
+        try:
+            self.remove(temppath)
+        except Exception:
+            # cleanup is best-effort; never mask the original failure
+            pass
+
+    def _drain_write_responses(self, fr):
+        """
+        Wait for and check all pending write responses for the open file
+        ``fr``, raising on any error.
+
+        Pipelined writes register their request numbers with ``type(None)``
+        rather than the file object, so `_finish_responses` does not see
+        them; this explicitly reaps each pending write response so that a
+        write-phase failure is detected before the file is closed.
+        """
+        while fr._reqs:
+            req = fr._reqs.popleft()
+            t, msg = self._read_response(req)
+            if t != CMD_STATUS:
+                raise SFTPError("Expected status")
+
+    def publishfo(
+        self, fl, remotepath, file_size=0, callback=None, confirm=True
+    ):
+        """
+        Publish the contents of an open file object (``fl``) to the SFTP
+        server at ``remotepath`` *atomically*.
+
+        Unlike `putfo`, which writes directly to ``remotepath``, this writes
+        to a unique temporary file in the same folder, closes it, and then
+        uses the OpenSSH ``posix-rename@openssh.com`` extension to rename the
+        temporary file over the destination.  The posix-rename extension
+        overwrites an existing destination atomically, so a failure at any
+        stage leaves the previous destination file intact.
+
+        The server must advertise support for the ``posix-rename`` extension;
+        this is checked *before* anything is written, and a server without the
+        extension is rejected rather than silently falling back to a
+        delete-then-rename sequence.
+
+        Failures are reported in stages via `.SFTPublishError`, whose
+        ``phase`` attribute is one of:
+
+        * ``"capability"`` -- the server does not support posix-rename;
+          nothing was written.
+        * ``"write"`` -- writing the temporary file failed.
+        * ``"close"`` -- closing the temporary file reported an error; the
+          destination was not touched.
+        * ``"rename"`` -- the final posix-rename failed; the destination was
+          not touched.
+
+        In every failure case, only the temporary path created by this
+        attempt is cleaned up; the existing destination file is preserved.
+
+        :param fl: opened file or file-like object to publish
+        :param str remotepath: the destination path on the SFTP server
+        :param int file_size:
+            optional size parameter passed to callback. If none is specified,
+            size defaults to 0
+        :param callable callback:
+            optional callback function (form: ``func(int, int)``) that accepts
+            the bytes transferred so far and the total bytes transferred
+        :param bool confirm:
+            whether to do a stat() on the file afterwards to confirm the file
+            size
+
+        :return:
+            an `.SFTPAttributes` object containing attributes about the given
+            file.
+
+        :raises:
+            `.SFTPublishError` -- if the server lacks the posix-rename
+            extension, or the write, close, or rename stage fails
+
+        .. versionadded:: 3.5
+        """
+        if not self.extension_supported(POSIX_RENAME_EXTENSION):
+            raise SFTPublishError(
+                "capability",
+                "server does not advertise the {!r} extension; refusing to "
+                "publish (no delete-then-rename fallback)".format(
+                    POSIX_RENAME_EXTENSION
+                ),
+            )
+        remotepath = self._adjust_cwd(remotepath)
+        temppath = self._publish_temp_path(remotepath)
+        fr = None
+        try:
+            try:
+                fr = self.open(temppath, "wb")
+                fr.set_pipelined(True)
+                size = self._transfer_with_callback(
+                    reader=fl,
+                    writer=fr,
+                    file_size=file_size,
+                    callback=callback,
+                )
+                # Reap pipelined write responses now, so a write-phase
+                # failure is reported before we attempt to close the file.
+                self._drain_write_responses(fr)
+            except Exception as e:
+                if fr is not None:
+                    # best effort; the write error is the root cause
+                    fr.close()
+                raise SFTPublishError("write", e)
+            try:
+                fr.close(raise_on_error=True)
+            except Exception as e:
+                raise SFTPublishError("close", e)
+            try:
+                self.posix_rename(temppath, remotepath)
+            except Exception as e:
+                raise SFTPublishError("rename", e)
+        except SFTPublishError:
+            # A failed publish never modifies the existing destination; only
+            # the temporary path created by this attempt is cleaned up.
+            self._publish_cleanup(temppath)
+            raise
+        if confirm:
+            s = self.stat(remotepath)
+            if s.st_size != size:
+                raise IOError(
+                    "size mismatch in publish!  {} != {}".format(
+                        s.st_size, size
+                    )
+                )
+        else:
+            s = SFTPAttributes()
+        return s
+
+    def publish(self, localpath, remotepath, callback=None, confirm=True):
+        """
+        Publish a local file (``localpath``) to the SFTP server at
+        ``remotepath`` *atomically*.
+
+        This is a convenience wrapper around `publishfo`; see that method for
+        the full semantics.  The server must support the posix-rename
+        extension, and failures are reported in stages via
+        `.SFTPublishError`.
+
+        :param str localpath: the local file to publish
+        :param str remotepath: the destination path on the SFTP server. Note
+            that the filename should be included. Only specifying a directory
+            may result in an error.
+        :param callable callback:
+            optional callback function (form: ``func(int, int)``) that accepts
+            the bytes transferred so far and the total bytes transferred
+        :param bool confirm:
+            whether to do a stat() on the file afterwards to confirm the file
+            size
+
+        :return: an `.SFTPAttributes` object containing attributes about the
+            given file
+
+        :raises:
+            `.SFTPublishError` -- if the server lacks the posix-rename
+            extension, or the write, close, or rename stage fails
+
+        .. versionadded:: 3.5
+        """
+        file_size = os.stat(localpath).st_size
+        with open(localpath, "rb") as fl:
+            return self.publishfo(fl, remotepath, file_size, callback, confirm)
 
     def getfo(
         self,

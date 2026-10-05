@@ -135,6 +135,14 @@ class BaseSFTP:
         self.logger = util.get_logger("paramiko.sftp")
         self.sock = None
         self.ultra_debug = False
+        # Extensions advertised by the peer in its version packet, as a
+        # mapping of extension name -> extension data.  Clients use this to
+        # check for optional behaviour (e.g. the posix-rename extension)
+        # before relying on it.
+        self._extensions = {}
+        # Extensions this server advertises to clients, as (name, data)
+        # pairs.  Subclasses may extend or replace this list.
+        self.server_extensions = (("check-file", "md5,sha1"),)
 
     # ...internals...
 
@@ -148,6 +156,16 @@ class BaseSFTP:
         version = struct.unpack(">I", data[:4])[0]
         #        if version != _VERSION:
         #            raise SFTPError('Incompatible sftp protocol')
+        # The version packet may carry extension pairs (name, data) after the
+        # version number; remember them so capability-dependent operations can
+        # check support up front instead of discovering it mid-operation.
+        self._extensions = {}
+        msg = Message(data)
+        msg.get_int()  # version
+        while msg.packet.tell() < len(data):
+            name = msg.get_text()
+            ext_data = msg.get_text()
+            self._extensions[name] = ext_data
         return version
 
     def _send_server_version(self):
@@ -157,11 +175,11 @@ class BaseSFTP:
         if t != CMD_INIT:
             raise SFTPError("Incompatible sftp protocol")
         version = struct.unpack(">I", data[:4])[0]
-        # advertise that we support "check-file"
-        extension_pairs = ["check-file", "md5,sha1"]
         msg = Message()
         msg.add_int(_VERSION)
-        msg.add(*extension_pairs)
+        for name, ext_data in self.server_extensions:
+            msg.add_string(name)
+            msg.add_string(ext_data)
         self._send_packet(CMD_VERSION, msg)
         return version
 
