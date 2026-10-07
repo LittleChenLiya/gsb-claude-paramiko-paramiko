@@ -282,6 +282,43 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
 
         handle = msg.get_string()
 
+        for attr in self._listdir_iter(handle, read_aheads):
+            yield attr
+        self._request(CMD_CLOSE, handle)
+
+    def listdir_iterator(self, path=".", read_aheads=50):
+        """
+        Closable iterator version of `.listdir_iter`.
+
+        Returns an `.SFTPDirIterator` yielding `.SFTPAttributes` objects,
+        using the same decoding logic as `.listdir_iter`.  Unlike the plain
+        generator, the returned object may be explicitly closed (and is a
+        context manager), so abandoning the iteration partway through still
+        sends exactly one ``SSH_FXP_CLOSE`` for the remote directory handle::
+
+            with sftp.listdir_iterator("/some/path") as it:
+                for attr in it:
+                    ...
+
+        .. versionadded:: 5.0
+        """
+        path = self._adjust_cwd(path)
+        self._log(DEBUG, "listdir({!r})".format(path))
+        t, msg = self._request(CMD_OPENDIR, path)
+
+        if t != CMD_HANDLE:
+            raise SFTPError("Expected handle")
+
+        handle = msg.get_string()
+        return SFTPDirIterator(self, handle, read_aheads)
+
+    def _listdir_iter(self, handle, read_aheads=50):
+        """
+        Core readdir/decode loop shared by `.listdir_iter` and
+        `.SFTPDirIterator`.  Yields `.SFTPAttributes` for an already-open
+        directory ``handle``; does **not** close the handle -- callers own
+        that responsibility.
+        """
         nums = list()
         while True:
             try:
@@ -320,7 +357,6 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
                 nums = list()
 
             except EOFError:
-                self._request(CMD_CLOSE, handle)
                 return
 
     def open(self, filename, mode="r", bufsize=-1):
@@ -955,6 +991,65 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         if self._cwd == b_slash:
             return self._cwd + path
         return self._cwd + b_slash + path
+
+
+class SFTPDirIterator:
+    """
+    Iterator over a remote directory listing, with explicit cleanup.
+
+    Returned by `.SFTPClient.listdir_iterator`; yields `.SFTPAttributes`
+    objects decoded exactly as `.SFTPClient.listdir_iter` does.  Unlike the
+    plain generator, this object owns its remote directory handle: calling
+    `.close` (or leaving a ``with`` block) sends exactly one
+    ``SSH_FXP_CLOSE`` for that handle -- whether the listing was consumed
+    fully, abandoned partway through, or aborted by a decoding error.  Only
+    the directory handle obtained from ``SSH_FXP_OPENDIR`` is ever closed;
+    unrelated file handles are never touched.
+
+    .. versionadded:: 5.0
+    """
+
+    def __init__(self, client, handle, read_aheads=50):
+        self._client = client
+        self._handle = handle
+        self._closed = False
+        self._gen = client._listdir_iter(handle, read_aheads)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._gen)
+        except StopIteration:
+            # Directory fully consumed: release the remote handle.
+            self.close()
+            raise
+        except Exception:
+            # Decoding (or any other) failure: still release the handle.
+            self.close()
+            raise
+
+    def close(self):
+        """
+        Close the remote directory handle.  Idempotent: the
+        ``SSH_FXP_CLOSE`` request is sent at most once, and only ever for
+        this iterator's own directory handle.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._gen.close()
+        self._client._request(CMD_CLOSE, self._handle)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
 
 
 class SFTP(SFTPClient):
