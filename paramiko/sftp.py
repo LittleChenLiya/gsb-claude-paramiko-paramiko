@@ -130,6 +130,61 @@ class SFTPError(Exception):
     pass
 
 
+class SFTPLinkError(SFTPError):
+    """
+    Base class for errors encountered while resolving a chain of remote
+    symbolic links.
+
+    The offending link, the whole chain walked so far and the configured
+    containment root are attached for inspection and logging.
+
+    .. versionadded:: 5.0
+    """
+
+    def __init__(self, reason, link, chain, root):
+        self.link = link
+        self.chain = list(chain)
+        self.root = root
+        walked = [each for each, _ in self.chain]
+        if link not in walked:
+            walked.append(link)
+        rendered = " -> ".join(walked)
+        super().__init__(
+            "{} (link {!r}, chain: {}, root: {!r})".format(
+                reason, link, rendered, root
+            )
+        )
+
+
+class SFTPLinkLoopError(SFTPLinkError):
+    """
+    Raised when a symbolic link chain loops back on itself or exceeds the
+    maximum allowed number of links.
+
+    .. versionadded:: 5.0
+    """
+
+    def __init__(self, link, chain, root, limit):
+        self.limit = limit
+        super().__init__(
+            "symbolic link loop or too many links", link, chain, root
+        )
+
+
+class SFTPRootEscapeError(SFTPLinkError):
+    """
+    Raised when resolving a symbolic link chain would leave the configured
+    remote root directory.
+
+    .. versionadded:: 5.0
+    """
+
+    def __init__(self, link, chain, root):
+        super().__init__(
+            "symbolic link escapes the remote root", link, chain, root
+        )
+
+
 class BaseSFTP:
     def __init__(self):
         self.logger = util.get_logger("paramiko.sftp")

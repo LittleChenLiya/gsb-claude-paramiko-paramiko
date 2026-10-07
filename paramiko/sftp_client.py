@@ -20,6 +20,7 @@
 from binascii import hexlify
 import errno
 import os
+import posixpath
 import stat
 import threading
 import time
@@ -61,6 +62,8 @@ from paramiko.sftp import (
     SFTP_NO_SUCH_FILE,
     SFTP_PERMISSION_DENIED,
     int64,
+    SFTPLinkLoopError,
+    SFTPRootEscapeError,
 )
 
 from paramiko.sftp_attr import SFTPAttributes
@@ -85,6 +88,118 @@ def _to_unicode(s):
 
 
 b_slash = b"/"
+
+
+def _normalize_remote_path(path):
+    """
+    Purely lexical normalization for a *remote* POSIX style path.
+
+    Only string manipulation is used -- unlike `os.path.realpath` this never
+    touches the local filesystem and never resolves local symbolic links.
+    """
+    # SFTP paths use a single leading slash; collapse duplicate separators
+    # without producing a "//" network-path prefix.
+    if path.startswith("//"):
+        path = "/" + path.lstrip("/")
+    return posixpath.normpath(path)
+
+
+def _join_remote_paths(base, link):
+    """
+    Resolve a (possibly relative) link target against the directory that
+    contains the link, using remote POSIX semantics only.
+    """
+    if link.startswith("/"):
+        return _normalize_remote_path(link)
+    return _normalize_remote_path(
+        posixpath.join(posixpath.dirname(base), link)
+    )
+
+
+def _is_inside_root(path, root):
+    """
+    Return ``True`` if ``path`` is equal to, or nested beneath, ``root``.
+    Both arguments must already be normalized absolute POSIX paths.
+    """
+    if path == root:
+        return True
+    return path.startswith(root + "/")
+
+
+def _resolve_link_chain(sftp, path, root, max_links):
+    """
+    Component-by-component remote symbolic link resolver used by
+    `.SFTPClient.resolve_symlinks`.
+
+    The only remote calls performed are ``lstat`` and ``readlink``; the target
+    is never opened and no local path resolution (`os.path.realpath`, a
+    ``stat()`` of a local file, ...) takes place. Relative link targets are
+    interpreted relative to the directory holding the link, as on POSIX.
+
+    Resolution is iterative (mirroring the kernel ``namei()`` procedure):
+    each path component is ``lstat``-ed in turn and, when it is a symbolic
+    link, replaced by its target before walking the remaining suffix.
+
+    :returns: ``(resolved_path, chain)`` where ``chain`` is the list of
+        ``(link_path, link_target)`` pairs that were followed, in order.
+    :raises `.SFTPRootEscapeError`: if the chain leaves ``root``.
+    :raises `.SFTPLinkLoopError`: if the chain loops or exceeds
+        ``max_links``.
+
+    .. versionadded:: 5.0
+    """
+    root = _normalize_remote_path(root)
+    original = _normalize_remote_path(path)
+    if not _is_inside_root(original, root):
+        raise SFTPRootEscapeError(original, [], root)
+
+    chain = []
+    seen_links = set()
+    # Components still to walk, starting from the root.
+    pending = [c for c in original[len(root):].split("/") if c]
+    current = root
+    while pending:
+        component = pending.pop(0)
+        candidate = _normalize_remote_path(posixpath.join(current, component))
+        # A plain ".." step (among other things) may climb out of the root.
+        if not _is_inside_root(candidate, root):
+            raise SFTPRootEscapeError(candidate, chain, root)
+        try:
+            attrs = sftp.lstat(candidate)
+        except IOError:
+            # Non-strict resolution: the trailing component may not exist yet
+            # (e.g. when preparing to create a file); a missing intermediate
+            # entry simply ends the walk.
+            return candidate, chain
+        if not stat.S_ISLNK(attrs.st_mode or 0):
+            current = candidate
+            continue
+        if candidate in seen_links:
+            raise SFTPLinkLoopError(candidate, chain, root, max_links)
+        seen_links.add(candidate)
+        try:
+            target = u(sftp.readlink(candidate))
+        except IOError as e:
+            raise SFTPError(
+                "unreadable symbolic link {!r}: {}".format(candidate, e)
+            )
+        if not target:
+            raise SFTPError(
+                "symbolic link {!r} has an empty target".format(candidate)
+            )
+        chain.append((candidate, target))
+        if len(chain) > max_links:
+            raise SFTPLinkLoopError(candidate, chain, root, max_links)
+        resolved = _join_remote_paths(candidate, target)
+        if not _is_inside_root(resolved, root):
+            raise SFTPRootEscapeError(candidate, chain, root)
+        # Replace the just-consumed component (and any path it sat in front
+        # of) with the link target, then keep walking the same suffix.
+        current = root
+        pending = [
+            c for c in resolved[len(root):].split("/") if c
+        ] + pending
+    return current, chain
 
 
 class SFTPClient(BaseSFTP, ClosingContextManager):
@@ -323,7 +438,7 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
                 self._request(CMD_CLOSE, handle)
                 return
 
-    def open(self, filename, mode="r", bufsize=-1):
+    def open(self, filename, mode="r", bufsize=-1, resolve_root=None):
         """
         Open a file on the remote server.  The arguments are the same as for
         Python's built-in `python:file` (aka `python:open`).  A file-like
@@ -351,10 +466,24 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         :param str filename: name of the file to open
         :param str mode: mode (Python-style) to open in
         :param int bufsize: desired buffering (default: ``-1``)
+        :param str resolve_root:
+            optional remote directory constraining symbolic-link resolution.
+            When given, ``filename`` is resolved component by component with
+            `resolve_symlinks` before the open request, using only remote
+            ``lstat``/``readlink`` calls; the resolution does not open the
+            target file, and a chain that loops or escapes ``resolve_root``
+            raises `.SFTPLinkLoopError` / `.SFTPRootEscapeError`. When
+            ``None`` (the default), no resolution is performed and the
+            historical interface behavior is preserved exactly.
         :return: an `.SFTPFile` object representing the open file
 
         :raises: ``IOError`` -- if the file could not be opened.
+
+        .. versionchanged:: 5.0
+            Added the ``resolve_root`` keyword argument.
         """
+        if resolve_root is not None:
+            filename, _ = self.resolve_symlinks(filename, resolve_root)
         filename = self._adjust_cwd(filename)
         self._log(DEBUG, "open({!r}, {!r})".format(filename, mode))
         imode = 0
@@ -614,6 +743,56 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         if count != 1:
             raise SFTPError("Readlink returned {} results".format(count))
         return _to_unicode(msg.get_string())
+
+    def resolve_symlinks(self, path, root, max_links=40):
+        """
+        Resolve the symbolic links in a remote path one component at a time,
+        constrained to stay inside a remote ``root`` directory.
+
+        Unlike `normalize` (which asks the server to canonicalize the path
+        and may return locations anywhere on the remote filesystem), this
+        helper performs the walk itself and only uses `lstat` and `readlink`
+        requests. Relative link targets are interpreted relative to the
+        directory containing the link (POSIX semantics), and no request is
+        ever made to open the final target file. All path manipulation is
+        purely lexical, so no local filesystem path resolution is involved.
+
+        :param str path:
+            remote path to resolve. It must be (after normalization) inside
+            ``root``; a relative ``path`` is interpreted as relative to
+            ``root`` rather than the emulated working directory.
+        :param str root:
+            absolute remote directory the resolution is confined to. Both
+            the starting path and every intermediate link target must remain
+            inside it.
+        :param int max_links:
+            maximum number of symbolic links that may be followed (default
+            40, matching Linux's ``MAXSYMLINKS``).
+
+        :return:
+            a ``(resolved_path, chain)`` tuple; ``chain`` is the list of
+            ``(link_path, link_target)`` pairs followed, in order (empty when
+            no links were involved).
+
+        :raises `.SFTPRootEscapeError`:
+            if ``path`` or any link target would leave ``root``.
+        :raises `.SFTPLinkLoopError`:
+            if the link chain loops or exceeds ``max_links``.
+        :raises `.SFTPError`:
+            if a symbolic link cannot be read.
+
+        .. versionadded:: 5.0
+        """
+        root = _normalize_remote_path(u(self._adjust_cwd(root)))
+        if not root.startswith("/") or root == ".":
+            raise SFTPError(
+                "resolve_symlinks root must be an absolute remote path: "
+                "{!r}".format(root)
+            )
+        target = u(path)
+        if not target.startswith("/"):
+            target = posixpath.join(root, target)
+        return _resolve_link_chain(self, target, root, max_links)
 
     def normalize(self, path):
         """
