@@ -70,7 +70,7 @@ from paramiko.rsakey import RSAKey
 from paramiko.ecdsakey import ECDSAKey
 from paramiko.ed25519key import Ed25519Key
 from paramiko.sftp import SFTPError, BaseSFTP
-from paramiko.sftp_client import SFTP, SFTPClient
+from paramiko.sftp_client import SFTP, SFTPClient, SFTPDirectoryIterator
 from paramiko.sftp_server import SFTPServer
 from paramiko.sftp_attr import SFTPAttributes
 from paramiko.sftp_handle import SFTPHandle
