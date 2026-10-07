@@ -86,6 +86,233 @@ def _to_unicode(s):
 
 b_slash = b"/"
 
+# Default cap on the number of symbolic links resolved for one path. Mirrors
+# the usual ``MAXSYMLINKS``/``ELOOP`` bound used by local filesystems so a
+# chain that is long (but not strictly cyclic) can't run away either.
+DEFAULT_MAX_SYMLINKS = 40
+
+
+class SFTPLinkError(IOError):
+    """
+    A symbolic link chain could not be resolved inside a remote root.
+
+    Raised by `.SFTPClient.resolve_links` (and by `.SFTPClient.open` when its
+    ``resolve_links`` option is enabled) when a link chain loops back on
+    itself, grows past the configured limit, or points outside of the
+    permitted remote root.
+
+    The offending path components are exposed for reporting:
+
+    - ``root``: the remote root the chain was constrained to
+    - ``path``: the path that was requested
+    - ``chain``: ordered list of *link* paths visited while resolving
+      (including the link that caused the failure)
+    - ``target``: the raw link target that escaped the root, or ``None``
+    """
+
+    def __init__(
+        self, errno, message, root=None, path=None, chain=None, target=None
+    ):
+        super().__init__(errno, message)
+        self.root = root
+        self.path = path
+        self.chain = list(chain or [])
+        self.target = target
+
+    def link_chain(self):
+        """
+        Return the ordered list of link paths visited before the failure.
+        """
+        return list(self.chain)
+
+
+def _split_remote_path(path):
+    """
+    Split a *remote* (POSIX-style, slash separated) path into components.
+
+    Unlike `os.path` based splitting, this never consults the local
+    filesystem or applies the local platform's path rules.
+    """
+    return [part for part in u(path).split("/") if part not in ("", ".")]
+
+
+def _join_remote_path(components):
+    """Join remote path components produced by `_split_remote_path`."""
+    return "/" + "/".join(components)
+
+
+def _lexical_normalize(parts, floor, clamp_at_floor=False):
+    """
+    Apply ``.``/``..`` processing to ``parts`` starting from ``floor``.
+
+    ``floor`` is the immutable prefix below which ``..`` cannot descend. If
+    it would, ``clamp_at_floor`` decides between staying put (the POSIX/
+    chroot treatment of a user supplied path) and returning ``None`` to
+    signal a containment breach (a link target escaping the root).
+    """
+    result = list(floor)
+    for part in parts:
+        if part == "..":
+            if len(result) > len(floor):
+                result.pop()
+            elif clamp_at_floor:
+                continue
+            else:
+                return None
+        else:
+            result.append(part)
+    return result
+
+
+def _resolve_remote_links(sftp, path, root, max_links=DEFAULT_MAX_SYMLINKS):
+    """
+    Resolve symbolic links one component at a time, constrained to ``root``.
+
+    Only the remote ``lstat`` and ``readlink`` operations are used; no local
+    path resolution happens and no target file is ever opened. Relative
+    link targets are interpreted relative to the directory containing the
+    link (POSIX semantics).
+
+    :returns: the resolved absolute remote path (always inside ``root``)
+    :raises SFTPLinkError: on a link loop, too many links, or an escape
+        outside ``root``
+    """
+    root = u(root)
+    if not root.startswith("/"):
+        raise SFTPLinkError(
+            errno.EINVAL,
+            "Remote root must be an absolute path: {!r}".format(root),
+            root=root,
+            path=path,
+        )
+    root_parts = _split_remote_path(root)
+
+    raw = u(path)
+    if raw.startswith("/"):
+        # Absolute input: normalize standalone (as the server would), then
+        # require it to already live inside the root.
+        components = _lexical_normalize(
+            _split_remote_path(raw), [], clamp_at_floor=True
+        )
+        if components[: len(root_parts)] != root_parts:
+            raise SFTPLinkError(
+                errno.EACCES,
+                "Path {!r} is outside remote root {!r}".format(raw, root),
+                root=root,
+                path=path,
+            )
+    else:
+        # Relative input (no session cwd after _adjust_cwd): anchor at the
+        # root and treat a straying ".." as staying inside the root.
+        components = _lexical_normalize(
+            _split_remote_path(raw), root_parts, clamp_at_floor=True
+        )
+
+    chain = []
+    # Map every resolved link path to the position it first appeared at, so
+    # cycles are detected with the full offending chain available.
+    seen = {}
+    links_followed = 0
+
+    # Resolve component by component, starting at the first component.
+    # Resolving a link replaces a suffix of the path, so we restart the walk
+    # from the beginning afterwards.
+    index = 0
+    while index < len(components):
+        current = components[: index + 1]
+        current_path = _join_remote_path(current)
+
+        attr = sftp.lstat(current_path)
+        mode = getattr(attr, "st_mode", None)
+        if mode is None or not stat.S_ISLNK(mode):
+            index += 1
+            continue
+
+        if current_path in seen:
+            # Two-node (or longer) cycle: this exact link was visited
+            # already. Report the chain starting at the loop's first link.
+            loop = chain[seen[current_path] :] + [current_path]
+            raise SFTPLinkError(
+                errno.ELOOP,
+                "Symbolic link loop detected: {}".format(" -> ".join(loop)),
+                root=root,
+                path=path,
+                chain=loop,
+            )
+        seen[current_path] = len(chain)
+        chain.append(current_path)
+
+        links_followed += 1
+        if links_followed > max_links:
+            raise SFTPLinkError(
+                errno.ELOOP,
+                "Too many levels of symbolic links (max {})".format(
+                    max_links
+                ),
+                root=root,
+                path=path,
+                chain=chain,
+            )
+
+        target = sftp.readlink(current_path)
+        if target is None:
+            # Server calls this a link but gives no target: treat the chain
+            # as broken rather than guessing.
+            raise SFTPLinkError(
+                errno.EINVAL,
+                "Unreadable symbolic link target at {!r}".format(
+                    current_path
+                ),
+                root=root,
+                path=path,
+                chain=chain,
+            )
+        target = u(target)
+
+        if target.startswith("/"):
+            # Absolute targets restart at the server root and must finish
+            # inside the configured root.
+            resolved = _lexical_normalize(
+                _split_remote_path(target), [], clamp_at_floor=True
+            )
+            escaped = resolved[: len(root_parts)] != root_parts
+        else:
+            # Relative targets are relative to the link's own directory.
+            # Normalize without any floor: a ".." that would climb above the
+            # filesystem root yields None, as does one that drops below the
+            # root prefix (both are containment breaches). The link directory
+            # components are absolute here, so the root prefix is preserved
+            # by the components themselves.
+            link_dir = current[:-1]
+            resolved = _lexical_normalize(
+                link_dir + _split_remote_path(target),
+                [],
+                clamp_at_floor=False,
+            )
+            escaped = resolved is None or (
+                resolved[: len(root_parts)] != root_parts
+            )
+
+        if escaped:
+            raise SFTPLinkError(
+                errno.EACCES,
+                "Symbolic link escapes remote root {!r}: {} -> {!r}".format(
+                    root, current_path, target
+                ),
+                root=root,
+                path=path,
+                chain=chain,
+                target=target,
+            )
+
+        # Replace the link component (plus anything already walked beyond
+        # it) with the target's components, then restart the walk from the
+        # first component so links within the target are resolved too.
+        components = resolved + components[index + 1 :]
+        index = 0
+
+    return _join_remote_path(components)
+
 
 class SFTPClient(BaseSFTP, ClosingContextManager):
     """
@@ -323,7 +550,49 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
                 self._request(CMD_CLOSE, handle)
                 return
 
-    def open(self, filename, mode="r", bufsize=-1):
+    def resolve_links(
+        self, path, root="/", max_links=DEFAULT_MAX_SYMLINKS
+    ):
+        """
+        Resolve symbolic links in ``path`` one component at a time, keeping
+        the result inside a remote ``root`` directory.
+
+        This is a *client side*, lexical resolver: it only performs remote
+        `lstat` and `readlink` requests (never `stat`, ``realpath``, or
+        ``open``), never uses local filesystem path processing, and never
+        opens the final target. Relative link targets are resolved relative
+        to the directory that contains the link, following POSIX semantics.
+
+        :param str path: remote path to resolve; may be absolute or relative
+            to this session's current directory (see `chdir`)
+        :param str root: absolute remote path that the link chain is not
+            allowed to leave (default ``"/"``)
+        :param int max_links: maximum number of links followed before the
+            chain is considered too long
+
+        :return: the resolved absolute remote path, guaranteed to be inside
+            ``root``
+
+        :raises SFTPLinkError: if the chain loops, exceeds ``max_links``, or
+            escapes ``root``; other SFTP errors (such as a missing path)
+            propagate as usual from `lstat`/`readlink`
+
+        .. versionadded:: 5.0
+        """
+        path = self._adjust_cwd(path)
+        return _resolve_remote_links(
+            self, path, root=root, max_links=max_links
+        )
+
+    def open(
+        self,
+        filename,
+        mode="r",
+        bufsize=-1,
+        resolve_links=False,
+        root="/",
+        max_links=DEFAULT_MAX_SYMLINKS,
+    ):
         """
         Open a file on the remote server.  The arguments are the same as for
         Python's built-in `python:file` (aka `python:open`).  A file-like
@@ -351,11 +620,29 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         :param str filename: name of the file to open
         :param str mode: mode (Python-style) to open in
         :param int bufsize: desired buffering (default: ``-1``)
+        :param bool resolve_links: when true, resolve symbolic links
+            component-by-component via `resolve_links` and verify the chain
+            stays inside ``root`` before opening the target. The default of
+            false preserves the previous behavior of handing ``filename``
+            straight to the server.
+        :param str root: remote root enforced while ``resolve_links`` is
+            enabled (ignored otherwise)
+        :param int max_links: maximum number of links followed while
+            ``resolve_links`` is enabled
         :return: an `.SFTPFile` object representing the open file
 
         :raises: ``IOError`` -- if the file could not be opened.
+        :raises SFTPLinkError: if ``resolve_links`` is enabled and the link
+            chain loops or escapes ``root``.
+
+        .. versionchanged:: 5.0
+            Added the ``resolve_links``, ``root`` and ``max_links`` options.
         """
         filename = self._adjust_cwd(filename)
+        if resolve_links:
+            filename = self.resolve_links(
+                filename, root=root, max_links=max_links
+            )
         self._log(DEBUG, "open({!r}, {!r})".format(filename, mode))
         imode = 0
         if ("r" in mode) or ("+" in mode):
